@@ -1,0 +1,1257 @@
+# 한 <-> 영 변환 +)tts
+# -*- coding: utf-8 -*-
+from flask import Flask, render_template_string, request, jsonify, abort, url_for
+import base64, io, os, shutil, uuid
+from PIL import Image
+import torch, torch.nn as nn
+from torchvision import transforms, models
+import requests
+import xml.etree.ElementTree as ET
+import pandas as pd
+from rapidfuzz import process, fuzz
+from werkzeug.utils import secure_filename
+from werkzeug.exceptions import RequestEntityTooLarge
+import json
+
+# -----------------------------------------------------
+# Google Cloud Translation API 클라이언트 초기화 (기존 코드 유지)
+# -----------------------------------------------------
+try:
+    from google.cloud import translate_v2 as translate
+    translate_client = translate.Client()
+    IS_REAL_API_ACTIVE = True
+    print("[INFO] Google Translate Client 초기화 완료 (실제 API 사용 모드)")
+except Exception as e:
+    IS_REAL_API_ACTIVE = False
+    print(f"[WARN] Google Translate Client 초기화 실패: {e}")
+    print("[WARN] 더미(Fallback) 번역 데이터로 전환합니다.")
+
+# --- static 폴더 구성 (기존 코드 유지) ---
+STATIC_DIR = os.path.join(os.getcwd(), "static")
+os.makedirs(STATIC_DIR, exist_ok=True)
+src_logo = os.path.join(os.getcwd(), "logo.png")
+dst_logo = os.path.join(STATIC_DIR, "logo.png")
+if os.path.exists(src_logo) and not os.path.exists(dst_logo):
+    shutil.copy(src_logo, dst_logo)
+
+# --- 임시 이미지 저장 폴더 (기존 코드 유지) ---
+TMP_DIR = os.path.join(os.getcwd(), "tmp")
+os.makedirs(TMP_DIR, exist_ok=True)
+
+# Flask 앱
+app = Flask(__name__, static_folder='static', static_url_path='/static')
+
+# --- 크기 제한 완화 (기존 코드 유지) ---
+app.config['MAX_CONTENT_LENGTH'] = 32 * 1024 * 1024
+app.config['MAX_FORM_MEMORY_SIZE'] = 16 * 1024 * 1024
+app.config['MAX_FORM_PARTS'] = 5000
+
+# ===== 알러지 목록 (UI 용) (기존 코드 유지) =====
+ALLERGENS = [
+    ("계란", "계란/난류"), ("우유", "우유"), ("밀", "밀"),
+    ("갑각류", "갑각류"), ("생선", "생선"), ("돼지고기", "돼지고기"),
+    ("견과류", "견과류"), ("조개", "조개"), ("복숭아", "복숭아"),
+    ("콩", "콩"), ("닭고기", "닭고기"),
+    ("메밀", "메밀"), ("쇠고기", "쇠고기"), ("키위", "키위"),
+    ("아몬드", "아몬드"), ("들깨", "들깨"), ("토마토", "토마토"),
+    ("오징어", "오징어")
+]
+ALLERGEN_MAP = {k: v for k, v in ALLERGENS}
+
+# ===== 알러지-재료 시노님 (기존 코드 유지) =====
+ALLERGEN_ING_SYNONYMS = {
+    "계란": ["계란", "달걀", "에그", "난백", "난황", "egg"],
+    "우유": ["우유", "밀크", "버터", "치즈", "요거트", "분유", "milk"],
+    "밀": ["밀", "밀가루", "소맥", "wheat", "글루텐","햄버거","라면","빵"],
+    "갑각류": ["새우", "새우살", "대하", "대게", "꽃게", "킹크랩", "랍스터", "게", "crab", "shrimp", "lobster"],
+    "생선": ["생선", "어류", "고등어", "연어", "참치", "삼치", "fish", "mackerel", "salmon", "tuna","북어","황태"],
+    "돼지고기": ["돼지고기", "돼지", "돈육", "pork"],
+    "견과류": ["땅콩", "peanut","호두", "walnut","콩", "대두", "두유", "soybean", "soy","잣"],
+    "조개": ["조개", "홍합", "바지락", "굴", "가리비", "clam", "mussel", "scallop", "oyster"],
+    "복숭아": ["복숭아", "peach"],
+    "콩": ["콩", "대두", "두유", "두부", "soybean", "soy", "tofu"],
+    "닭고기": ["닭고기", "닭", "치킨", "계육", "chicken"],
+    "메밀": ["메밀", "buckwheat"],
+    "쇠고기": ["쇠고기", "소고기", "소", "beef"],
+    "키위": ["키위", "kiwi"],
+    "아몬드": ["아몬드", "almond"],
+    "들깨 ": ["들깨", "perilla", "perilla seed"],
+    "토마토": ["토마토", "tomato","케첩"],
+    "오징어": ["오징어", "squid"],
+}
+ALLERGEN_MAP = {k: v for k, v in ALLERGENS}
+
+# ===== 알러지-재료 시노님 (기존 코드 유지) =====
+ALLERGEN_ING_SYNONYMS = {
+    "계란": ["계란", "달걀", "에그", "난백", "난황", "egg"],
+    "우유": ["우유", "밀크", "버터", "치즈", "요거트", "분유", "milk"],
+    "밀": ["밀", "밀가루", "소맥", "wheat", "글루텐","햄버거","라면","빵"],
+    "갑각류": ["새우", "새우살", "대하", "대게", "꽃게", "킹크랩", "랍스터", "게", "crab", "shrimp", "lobster"],
+    "생선": ["생선", "어류", "고등어", "연어", "참치", "삼치", "fish", "mackerel", "salmon", "tuna","북어","황태"],
+    "돼지고기": ["돼지고기", "돼지", "돈육", "pork"],
+    "견과류": ["땅콩", "peanut","호두", "walnut","콩", "대두", "두유", "soybean", "soy","잣"],
+    "조개": ["조개", "홍합", "바지락", "굴", "가리비", "clam", "mussel", "scallop", "oyster"],
+    "복숭아": ["복숭아", "peach"],
+    "콩": ["콩", "대두", "두유", "soybean", "soy"],
+    "닭고기": ["닭고기", "닭", "치킨", "계육", "chicken"],
+    "메밀": ["메밀", "buckwheat"],
+    "쇠고기": ["쇠고기", "소고기", "소", "beef"],
+    "키위": ["키위", "kiwi"],
+    "아몬드": ["아몬드", "almond"],
+    "들깨 ": ["들깨", "perilla", "perilla seed"],
+    "토마토": ["토마토", "tomato","케첩"],
+    "오징어": ["오징어", "squid"],
+}
+
+# ===== 모델/라벨 (기존 코드 유지) =====
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+def load_label_map(path="food_list.txt"):
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            cls = [ln.strip() for ln in f if ln.strip()]
+        if cls:
+            print(cls)
+            return cls
+    return ["bibimbap","kimchi_stew","ramyeon","bulgogi","tteokbokki","kimbap","jajangmyeon","jjamppong"]
+
+
+CLASS_NAMES = load_label_map()
+NUM_CLASSES = len(CLASS_NAMES)
+
+def build_resnet18(num_classes):
+    try: model = models.resnet18(weights=None)
+    except Exception: model = models.resnet18(pretrained=False)
+    in_f = model.fc.in_features
+    model.fc = nn.Linear(in_f, num_classes)
+    return model
+
+class DummyModel(nn.Module):
+    def __init__(self, n): super().__init__(); self.n=n
+    def forward(self, x): return torch.randn(x.size(0), self.n, device=x.device)
+
+def try_load_model(n, ckpt="final_model_e47_b16_lr0001_acc99.pt"):
+    if not os.path.exists(ckpt):
+        print("[INFO] best_model.pt 없음 → DummyModel")
+        return DummyModel(n).to(device), 224
+    ckpt_obj = torch.load(ckpt, map_location='cpu', weights_only=False)
+    img_size = 224
+    if isinstance(ckpt_obj, dict) and "img_size" in ckpt_obj:
+        img_size = ckpt_obj["img_size"]
+
+    model = build_resnet18(n)
+    try:
+        if isinstance(ckpt_obj, dict) and "model_state_dict" in ckpt_obj:
+            state = ckpt_obj["model_state_dict"]
+            model.load_state_dict(state, strict=True)
+            print("[INFO] ResNet 가중치(state_dict) 로드 완료")
+
+        # ★ 추가: ckpt가 '그냥 state_dict'인 경우 처리
+        elif isinstance(ckpt_obj, dict) and all(torch.is_tensor(v) for v in ckpt_obj.values()):
+            model.load_state_dict(ckpt_obj, strict=True)
+            print("[INFO] 순수 state_dict 로드 완료")
+            
+        elif hasattr(ckpt_obj, "state_dict"):
+            model = ckpt_obj
+            print("[INFO] 전체 모델 로드 완료")
+        else:
+            print("[WARN] 알 수 없는 ckpt 형식 → DummyModel")
+            model = DummyModel(n)
+    except Exception as e:
+        print("[WARN] 로드 실패 → DummyModel:", e)
+        model = DummyModel(n)
+    return model.to(device), img_size
+
+MODEL, IMG_SIZE = try_load_model(NUM_CLASSES)
+
+
+def build_tfms(img_size=224):
+    return transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+
+TFMS = build_tfms(IMG_SIZE)
+
+transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomRotation(10),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+
+
+MODEL.eval()
+
+MAX_UPLOAD_WIDTH = 1280
+def resize_if_large(img: Image.Image, max_w=MAX_UPLOAD_WIDTH):
+    if img.width > max_w:
+        h = int(img.height * (max_w / img.width))
+        return img.resize((max_w, h))
+    return img
+
+def save_temp_image(img_pil: Image.Image):
+    token = uuid.uuid4().hex
+    path = os.path.join(TMP_DIR, f"{token}.jpg")
+    img_pil.save(path, format="JPEG", quality=90)
+    return token, path
+
+def load_temp_image(token: str):
+    path = os.path.join(TMP_DIR, f"{token}.jpg")
+    if not (token and os.path.exists(path)):
+        abort(400, "임시 이미지가 만료되었거나 존재하지 않습니다.")
+    return Image.open(path).convert("RGB"), path
+
+
+
+# ===== 언어 맵 (Fallback/UI 관리를 위한 데이터) (기존 코드 유지) =====
+LANGUAGE_DATA = {
+    "ui": {
+        "ko": {
+            "title": "FoodSafe AI", "desc": "음식 사진을 올리시면 체크하신 ‘알러지’와 ‘피하고 싶은 재료’의 포함 여부를 확인해드려요.",
+            "select_img": "음식 사진을 선택해주세요!", "select_allergy": "피하고 싶은 알러지를 선택해주세요! (복수 선택 가능)",
+            "selected_items": "현재 선택된 항목:", "avoid_foods_label": "피하고 싶은 재료를 적어주세요",
+            "avoid_foods_ph1": "예: 오이", "avoid_foods_ph2": "예: 고수", "avoid_foods_ph3": "예: 청양고추",
+            "check_btn": "확인하기", "copyright": "업로드 이미지는 서버 임시 폴더(tmp)에 보관되며, 새로고침/만료 시 삭제될 수 있어요. (가중치: best_model.pt, 라벨: label_map.txt)",
+            "result_title": "결과 확인", "result_desc": "업로드하신 사진을 분석한 결과와 주의가 필요한 항목을 정리했어요.",
+            "predicted_food": "예측된 음식", "allergy_check": "알러지", "checked_allergy": "체크한 알러지 :",
+            "no_allergy_selected": "선택한 알러지가 없습니다.", "result_check": "결과 :",
+            "no_allergy_hit": "해당 음식에는 체크하신 알러지를 유발하는 재료가 들어있지 않아요.",
+            "avoid_foods_list": "피하고 싶은 재료", "no_avoid_input": "", "no_avoid_hit": "해당 음식에는 입력하신 재료가 들어있지 않아요.",
+            "back_btn": "처음으로 돌아가기", "voice_btn": "음성으로 안내", "choose_title": "음식 후보를 선택해주세요",
+            "choose_desc": "모델 확신도가 낮아 Top-3 후보를 보여드려요. 가장 가까운 음식을 선택하면 결과를 맞춤으로 보여드릴게요.",
+            "candidate_list": "후보 목록", "select_food_btn": "이 음식으로 결과 보기", "확률": "확률",
+        },
+        "en": {
+            "title": "FoodSafe AI", "desc": "Upload a food photo, and we'll check for the allergens and ingredients you wish to avoid.",
+            "select_img": "Select a food image!", "select_allergy": "Select allergens to avoid (multiple selections possible)",
+            "selected_items": "Currently selected items:", "avoid_foods_label": "Enter ingredients to avoid",
+            "avoid_foods_ph1": "e.g.: Cucumber", "avoid_foods_ph2": "e.g.: Cilantro", "avoid_foods_ph3": "e.g.: Cheongyang Chili",
+            "check_btn": "Check Results", "copyright": "The uploaded image is kept in a temporary server folder (tmp) and may be deleted upon refresh or expiration. (Weights: <code>best_model.pt</code>, Labels: <code>label_map.txt</code>)",
+            "result_title": "Results", "result_desc": "Here are the results of the analysis of your uploaded photo, with cautionary items highlighted.",
+            "predicted_food": "Predicted Food", "allergy_check": "Allergens", "checked_allergy": "Checked Allergens:",
+            "no_allergy_selected": "No allergens selected.", "result_check": "Result:",
+            "no_allergy_hit": "The dish does not contain ingredients that trigger the checked allergens.",
+            "avoid_foods_list": "Ingredients to Avoid", "no_avoid_input": "", "no_avoid_hit": "The dish does not contain the ingredients you entered.",
+            "back_btn": "Go Back to Start", "voice_btn": "Audio Guide", "choose_title": "Select a Food Candidate",
+            "choose_desc": "Model confidence is low, showing the Top-3 candidates. Select the closest match to view tailored results.",
+            "candidate_list": "Candidate List", "select_food_btn": "View Results with This Food", "확률": "Probability",
+        }
+    },
+    "dynamic": {
+        "allergens": {
+            "계란": "Egg", "우유": "Milk", "밀": "Wheat", "갑각류": "Crustacean", "생선": "Fish",
+            "돼지고기": "Pork", "견과류": "Nuts", "조개": "Shellfish", "복숭아": "Peach", "콩": "Soy",
+            "닭고기": "Chicken", "메밀": "Buckwheat", "쇠고기": "Beef", "키위": "Kiwi",
+            "아몬드": "Almond", "들깨": "Perilla Seed", "토마토": "Tomato", "오징어": "Squid",
+        },
+        "foods": {
+            "bibimbap": "Bibimbap", "kimchi_stew": "Kimchi Stew", "ramyeon": "Ramyeon",
+            "bulgogi": "Bulgogi", "tteokbokki": "Tteokbokki", "kimbap": "Kimbap",
+            "jajangmyeon": "Jajangmyeon", "jjamppong": "Jjamppong",
+        }
+    }
+}
+
+def translate_text_with_api(text_list, target_language, source_language='ko'):
+    """
+    Google Cloud Translation API를 사용하거나, 실패 시 Fallback 맵을 사용하여 번역을 수행합니다.
+    """
+    if target_language == source_language:
+        return text_list
+    
+    # 1. 실제 API 호출 시도
+    if IS_REAL_API_ACTIVE:
+        try:
+            results = translate_client.translate(
+                text_list,
+                target_language=target_language,
+                source_language=source_language
+            )
+            translated_texts = [result['translatedText'] for result in results]
+            return translated_texts
+        except Exception as e:
+            print(f"[ERROR] API 호출 실패, Fallback 사용: {e}")
+
+    # 2. Fallback 로직 (API 실패 또는 비활성화 시)
+    print("[INFO] Fallback 번역 로직을 사용합니다.")
+    translated_texts = []
+    dynamic_map = LANGUAGE_DATA['dynamic']
+    
+    for text in text_list:
+        found_translation = None
+        
+        is_short_name = text in dynamic_map['allergens'] or text in dynamic_map['foods']
+        
+        if is_short_name and target_language == 'en':
+             if text in dynamic_map['allergens']: found_translation = dynamic_map['allergens'][text]
+             elif text in dynamic_map['foods']: found_translation = dynamic_map['foods'][text]
+        
+        # 문장 번역은 Fallback 맵에서 찾을 수 없으므로 원본 반환 (실패 시)
+        if found_translation is None:
+            translated_texts.append(text)
+        else:
+            translated_texts.append(found_translation)
+
+    return translated_texts
+
+
+# [추가] 클라이언트에서 UI 전체 텍스트를 요청할 엔드포인트
+@app.route("/translate_text", methods=["POST"])
+def translate_ui_data():
+    target_lang = request.json.get("target_lang", "en")
+    
+    # UI 정적 텍스트 반환 (미리 정의된 맵 사용)
+    ui_data = LANGUAGE_DATA["ui"].get(target_lang, LANGUAGE_DATA["ui"]["ko"])
+    dynamic_data = {}
+    
+    ko_allergen_codes = list(LANGUAGE_DATA["dynamic"]["allergens"].keys())
+    ko_allergen_names = [ALLERGEN_MAP[code] for code in ko_allergen_codes]
+
+    if target_lang == 'en':
+        # 1. 알러지 코드(짧은 이름) 번역: API 또는 Fallback 사용
+        en_allergen_codes_translated = translate_text_with_api(ko_allergen_codes, 'en')
+        # 2. 알러지 전체 이름(표시용) 번역: API 또는 Fallback 사용
+        en_allergen_names_translated = translate_text_with_api(ko_allergen_names, 'en')
+        
+        dynamic_data["allergens"] = dict(zip(ko_allergen_codes, en_allergen_codes_translated))
+        dynamic_data["full_allergens"] = dict(zip(ko_allergen_names, en_allergen_names_translated))
+
+        # 음식 이름 번역
+        ko_foods = list(LANGUAGE_DATA["dynamic"]["foods"].keys())
+        en_foods = translate_text_with_api(ko_foods, 'en')
+        dynamic_data["foods"] = dict(zip(ko_foods, en_foods))
+        
+    else: # ko일 경우
+        dynamic_data["allergens"] = {k: k for k in ko_allergen_codes}
+        dynamic_data["full_allergens"] = {k: k for k in ko_allergen_names}
+        dynamic_data["foods"] = {k: k for k in LANGUAGE_DATA["dynamic"]["foods"].keys()}
+
+    return jsonify({
+        "ui": ui_data,
+        "dynamic": dynamic_data
+    })
+
+
+
+
+# ===== 스타일 (BASE_CSS 정의는 동일) =====
+BASE_CSS = """
+<style>
+  :root { --bg:#fffff0; --card:#ffffff; --text:#222; --muted:#555; --accent:#6aa3ff; }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{
+    margin:0; background:var(--bg); color:var(--text);
+    font-family:ui-sans-serif,system-ui,Segoe UI,Roboto,Noto Sans KR,Helvetica,Arial;
+    position:relative; overflow-x:hidden;
+  }
+  /* 양옆 배경 로고: 살짝 축소 */
+  body::before, body::after{
+    content:""; position:fixed; top:50%; transform:translateY(-50%);
+    width:min(34vw, 560px); height:min(34vw, 560px);
+    background-image:url('/static/logo.png');
+    background-size:contain; background-repeat:no-repeat; background-position:center;
+    opacity:1.0; filter:drop-shadow(0 6px 18px rgba(0,0,0,.12));
+    pointer-events:none; z-index:0;
+  }
+  body::before{ left:1vw; }
+  body::after{ right:1vw; }
+  @media(max-width: 980px){ body::before, body::after{ display:none; } }
+
+  /* 상하 여백 살짝 축소 */
+  .wrap{max-width:900px;margin:24px auto;padding:0 12px; position:relative; z-index:1;}
+  .card{
+    background:var(--card); border:1px solid rgba(0,0,0,.08);
+    border-radius:12px; padding:16px; box-shadow:0 2px 6px rgba(0,0,0,0.05);
+  }
+  h1{margin:0 0 6px; font-size:26px}
+  h2{margin:0 0 8px; font-size:18px}
+  h3{margin:10px 0 6px; font-size:15px}
+  .muted{color:var(--muted)}
+  label{display:block;margin:8px 0 6px;color:var(--muted); font-size:14px}
+  .btn{
+    background:var(--accent); color:#fff; border:none; padding:8px 12px;
+    border-radius:10px; font-weight:700; cursor:pointer; font-size:14px
+  }
+  .btn:hover{filter:brightness(1.05)}
+  .badge{display:inline-block;padding:3px 7px;border-radius:999px;background:#f2f2f2;color:#333;margin:2px 6px 2px 0;font-size:11px}
+  .small{font-size:12px;color:var(--muted)}
+  .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  table{width:100%;border-collapse:collapse;margin-top:6px}
+  th,td{border-bottom:1px solid rgba(0,0,0,.08);padding:6px 4px;text-align:left}
+  th{color:var(--muted)}
+  input[type=file]{
+    width:100%; padding:10px; border-radius:10px; border:1px solid rgba(0,0,0,.12);
+    background:#fafafa; color:#222; font-size:14px
+  }
+  img.preview{max-width:100%;border-radius:10px;border:1px solid rgba(0,0,0,.08);display:none}
+  .grid{display:grid;grid-template-columns:1fr;gap:12px}
+  @media(min-width:980px){ .grid{grid-template-columns:1.8fr 1fr} }
+  .checks label{display:flex;gap:8px;align-items:center;color:#333;font-size:14px}
+  .avoid-label{margin-top:14px;color:#444;font-weight:600}
+  .avoid-input{
+    width:100%; margin-top:6px; padding:8px; border-radius:8px;
+    border:1px solid rgba(0,0,0,.15); background:#fafafa; color:#222; font-size:14px
+  }
+  .avoid-input:focus{ outline:none; border-color:var(--accent); box-shadow:0 0 0 2px rgba(106,163,255,0.18); }
+  .result-grid{display:grid;grid-template-columns:1fr;gap:12px}
+  @media(min-width:980px){ .result-grid{grid-template-columns:1fr 1fr} }
+  .pill{display:inline-block;padding:5px 9px;border-radius:999px;background:#eef3ff;color:#1a2e66;margin:3px 5px 0 0;font-size:12px}
+  .ok{background:#e9f9ef;color:#0d6b3d}
+  .warn{background:#fff2f0;color:#8a1f11}
+  .radio-list{display:flex;flex-direction:column;gap:8px;margin-top:8px}
+  .choice-card{border:1px solid rgba(0,0,0,.08);border-radius:10px;padding:8px}
+  .brand{display:flex;align-items:center;gap:10px;margin:0 0 6px}
+  .brand img{height:36px;width:36px;object-fit:contain;border-radius:8px}
+
+  /* [추가] 언어 버튼 스타일 */
+  .lang-switch{
+    position:absolute; top:20px; right:20px;
+    display:flex; gap:6px; background:#f2f2f2; border-radius:8px; padding:4px;
+    z-index: 10; /* 다른 요소 위에 표시 */
+  }
+  .lang-btn{
+    padding:4px 8px; border-radius:6px; cursor:pointer; font-size:13px; font-weight:600;
+    border:none; background:transparent; color:var(--muted);
+  }
+  .lang-btn.active{ background:var(--card); color:var(--text); box-shadow:0 1px 3px rgba(0,0,0,.1);}
+  @media(max-width: 980px){ .lang-switch{ top:12px; right:12px; } }
+
+  /* Desktop에서 카드가 너무 아래로 밀리지 않게 전체 여백/패딩 축소 */
+  @media (max-width: 980px){
+    .wrap{
+      margin: 0 auto;
+      min-height: 100svh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding:
+        max(12px, env(safe-area-inset-top))
+        12px
+        max(12px, env(safe-area-inset-bottom))
+        12px;
+    }
+    .wrap > .card{ width: 100%; }
+  }
+
+  /* [A11Y] 스크린리더 전용 */
+  .sr-only {
+    position:absolute !important;
+    width:1px !important;
+    height:1px !important;
+    padding:0 !important;
+    margin:-1px !important;
+    overflow:hidden !important;
+    clip:rect(0,0,0,0) !important;
+    white-space:nowrap !important;
+    border:0 !important;
+  }
+</style>
+"""
+
+
+
+# ===== 메인 페이지 =====
+INDEX_HTML = BASE_CSS + """
+<div class="wrap">
+  <div class="card">
+    <div class="lang-switch">
+      <button class="lang-btn active" id="langKo" data-lang="ko">한국어</button>
+      <button class="lang-btn" id="langEn" data-lang="en">English</button>
+    </div>
+    <div class="brand">
+      <img src="{{ url_for('static', filename='logo.png') }}" alt="FoodSafe AI logo">
+      <h1 data-ko-key="title">FoodSafe AI</h1>
+    </div>
+    <p class="muted" data-ko-key="desc">음식 사진을 올리시면 체크하신 ‘알러지’와 ‘피하고 싶은 재료’의 포함 여부를 확인해드려요.</p>
+
+    <form id="resultForm" action="/result" method="POST" enctype="multipart/form-data">
+      <div class="grid">
+        <div class="card">
+          <label data-ko-key="select_img"> 음식 사진을 선택해주세요!</label>
+          <input id="fileInput" name="image" type="file" accept="image/*" required>
+          <span id="fileName" class="small" style="display:inline-block;margin-top:8px;"></span>
+          <div style="margin-top:12px"><img id="imgPreview" class="preview" alt="preview"></div>
+        </div>
+
+        <div class="card">
+          <label data-ko-key="select_allergy"> 피하고 싶은 알러지를 선택해주세요! (복수 선택 가능)</label>
+          <div class="checks" id="allergenChecks">
+            {% for code, name in allergens %}
+              <label><input type="checkbox" name="allergens" value="{{ code }}"> {{ name }}</label>
+            {% endfor %}
+          </div>
+          <div style="margin-top:12px">
+            <div class="small" data-ko-key="selected_items"> 현재 선택된 항목:</div>
+            <div id="selectedBadges"></div>
+          </div>
+
+          <label class="avoid-label" data-ko-key="avoid_foods_label"> 피하고 싶은 재료를 적어주세요</label>
+          <input type="text" name="avoid_foods" class="avoid-input" data-ko-ph-key="avoid_foods_ph1" placeholder="예: 오이">
+          <input type="text" name="avoid_foods" class="avoid-input" data-ko-ph-key="avoid_foods_ph2" placeholder="예: 고수">
+          <input type="text" name="avoid_foods" class="avoid-input" data-ko-ph-key="avoid_foods_ph3" placeholder="예: 청양고추">
+        </div>
+      </div>
+
+      <div class="row" style="margin-top:16px; justify-content:flex-end">
+        <button class="btn" type="submit" data-ko-key="check_btn"> 확인하기</button>
+      </div>
+    </form>
+
+    <p class="small" style="margin-top:12px" data-ko-key="copyright">
+      ※ 업로드 이미지는 서버 임시 폴더(tmp)에 보관되며, 새로고침/만료 시 삭제될 수 있어요. (가중치: <code>best_model.pt</code>, 라벨: <code>label_map.txt</code>)
+    </p>
+  </div>
+</div>
+
+<script>
+  const fileInput = document.getElementById('fileInput');
+  const imgPreview = document.getElementById('imgPreview');
+  const fileNameEl = document.getElementById('fileName');
+  const checksBox = document.getElementById('allergenChecks');
+  const selectedBadges = document.getElementById('selectedBadges');
+  const langBtns = document.querySelectorAll('.lang-btn');
+  // [수정] 초기 언어는 localStorage에서 가져오거나, 없으면 'ko'로 설정
+  let currentLang = localStorage.getItem('appLang') || 'ko'; 
+
+  // 페이지 로드 시, 이미 한국어가 아니면 언어 전환을 즉시 시도 (localStorage 유지)
+  document.addEventListener('DOMContentLoaded', () => {
+      // 1. 초기 버튼 활성화
+      langBtns.forEach(btn => btn.classList.remove('active'));
+      const activeBtn = document.getElementById(`lang${currentLang === 'ko' ? 'Ko' : 'En'}`);
+      if (activeBtn) activeBtn.classList.add('active');
+      
+      // 2. 알러지 항목에 전체 한국어 이름 저장 (초기 로드 시 한 번만 수행)
+      checksBox.querySelectorAll('label').forEach(label => {
+        let textNode = Array.from(label.childNodes).find(n => n.nodeType === 3);
+        if (textNode) {
+            const ko_name = textNode.nodeValue.trim();
+            label.setAttribute('data-ko-full-name', ko_name);
+        }
+      });
+      
+      // 3. 현재 언어가 'ko'가 아니면 번역 실행
+      if (currentLang !== 'ko') {
+          switchLanguage(currentLang, false); // false는 localStorage 업데이트 방지
+      }
+  });
+
+
+  fileInput.addEventListener('change', (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) { imgPreview.style.display='none'; imgPreview.src=''; fileNameEl.textContent=''; return; }
+    const url = URL.createObjectURL(file);
+    imgPreview.src = url; imgPreview.style.display='block'; fileNameEl.textContent = "선택됨: " + file.name;
+    imgPreview.onload = () => URL.revokeObjectURL(url);
+  });
+
+  function refreshBadges(){
+    selectedBadges.innerHTML='';
+    checksBox.querySelectorAll('input[type="checkbox"]').forEach(cb=>{
+      if(cb.checked){
+        // 뱃지 텍스트를 체크박스 텍스트 노드에서 가져옴
+        let textNode = Array.from(cb.parentElement.childNodes).find(n => n.nodeType === 3);
+        const tagName = textNode ? textNode.nodeValue.trim() : cb.parentElement.textContent.trim();
+        const tag=document.createElement('span'); tag.className='badge';
+        tag.textContent=tagName; selectedBadges.appendChild(tag);
+      }
+    });
+  }
+  checksBox.addEventListener('change', refreshBadges); refreshBadges();
+
+  document.getElementById('resultForm').addEventListener('submit', (e)=>{
+    if(!fileInput.files || !fileInput.files[0]){ e.preventDefault(); alert('먼저 음식 사진을 선택해주세요!'); }
+  });
+
+  // =================================================================
+  // [수정] 언어 전환 로직 (Local Storage 업데이트 로직 포함)
+  function switchLanguage(lang, updateLocalStorage = true) {
+    if (lang === currentLang && updateLocalStorage) return;
+
+    // 1. 버튼 상태 업데이트
+    langBtns.forEach(btn => btn.classList.remove('active'));
+    document.getElementById(`lang${lang === 'ko' ? 'Ko' : 'En'}`).classList.add('active');
+
+    // 2. Local Storage 업데이트
+    if (updateLocalStorage) {
+        localStorage.setItem('appLang', lang);
+        currentLang = lang; // 현재 언어 상태 업데이트
+    }
+
+
+    // 3. 서버에서 번역 데이터 요청
+    fetch('/translate_text', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ target_lang: lang })
+    })
+    .then(res => res.json())
+    .then(data => {
+      const uiTranslations = data.ui;
+      const dynamicTranslations = data.dynamic;
+      
+      // 4. UI 텍스트 교체 (data-ko-key 활용)
+      document.querySelectorAll('[data-ko-key]').forEach(el => {
+        const key = el.getAttribute('data-ko-key');
+        if (uiTranslations[key]) {
+            el.innerHTML = uiTranslations[key];
+        }
+      });
+
+      // 5. Placeholder 교체
+      document.querySelectorAll('[data-ko-ph-key]').forEach(el => {
+        const key = el.getAttribute('data-ko-ph-key');
+        if (uiTranslations[key]) {
+            el.placeholder = uiTranslations[key];
+        }
+      });
+
+      // 6. 체크박스 텍스트 및 뱃지 교체 (알러지 이름 교체)
+      checksBox.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+        let textNode = Array.from(cb.parentElement.childNodes).find(n => n.nodeType === 3);
+        if (!textNode) return; 
+
+        const koFullName = cb.parentElement.getAttribute('data-ko-full-name'); 
+        let newName = koFullName;
+
+        // dynamicTranslations.full_allergens를 사용하여 번역본을 찾음 (key: 전체 한국어 이름)
+        if (dynamicTranslations.full_allergens && dynamicTranslations.full_allergens[koFullName]) {
+             newName = dynamicTranslations.full_allergens[koFullName];
+        } else if (lang === 'ko') {
+            // 한국어 선택 시 전체 한국어 이름으로 복원
+            newName = koFullName;
+        }
+
+        // 텍스트 노드 업데이트 (앞뒤 공백 유지)
+        textNode.nodeValue = ` ${newName}`;
+      });
+
+      refreshBadges(); // 뱃지 텍스트 갱신
+
+    })
+    .catch(error => {
+      console.error('Translation error:', error);
+      alert('번역 데이터 로드에 실패했습니다.');
+    });
+  }
+
+  langBtns.forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      switchLanguage(e.target.dataset.lang, true); // Local Storage 업데이트
+    });
+  });
+</script>
+"""
+
+
+
+# ===== 결과 페이지 =====
+RESULT_HTML = BASE_CSS + """
+<div class="wrap">
+  <div class="card">
+    <div class="lang-switch">
+      <button class="lang-btn active" id="langKo" data-lang="ko">한국어</button>
+      <button class="lang-btn" id="langEn" data-lang="en">English</button>
+    </div>
+    <h1 data-ko-key="result_title"> 결과 확인</h1>
+    <p class="muted" data-ko-key="result_desc">업로드하신 사진을 분석한 결과와 주의가 필요한 항목을 정리했어요.</p>
+
+    <div class="result-grid">
+      <div class="card">
+        <h2 data-ko-key="predicted_food">예측된 음식</h2>
+        <p style="font-size:18px;font-weight:800"><span id="food-name-display">{{ food_name }}</span></p>
+        <div style="margin-top:10px">
+          {% if img_data_url %}<img src="{{ img_data_url }}" alt="uploaded" style="max-width:100%;border-radius:12px;border:1px solid rgba(0,0,0,.08)">{% else %}<div class="small muted">이미지를 표시할 수 없습니다.</div>{% endif %}
+        </div>
+      </div>
+
+      <div class="card">
+        <h2 data-ko-key="allergy_check">알러지</h2>
+
+        <div id="a11y-announce" class="sr-only" aria-live="polite" role="status"></div>
+
+        <h3 style="margin-top:8px" data-ko-key="checked_allergy">체크한 알러지 :</h3>
+        <div id="checked-allergens">{% if allergens and allergens|length>0 %}{% for a in allergens 
+        %}<span class="pill" data-ko-name="{{ a }}">{{ a }}</span>{% endfor %}{% else %}<div class="small muted" data-ko-key="no_allergy_selected">선택한 알러지가 없습니다.</div>{% endif %}</div>
+
+        <h3 style="margin-top:18px" data-ko-key="result_check">결과 :</h3>
+        <div id="allergy-result-list">
+          {% if allergy_hits and allergy_hits|length>0 %}
+            {% for hit in allergy_hits %}
+              <div class="pill warn" style="display:block;margin:6px 0;">
+                <span data-kr-text="{{ hit.kr_text | safe }}" data-en-text="{{ hit.en_text | safe }}">
+                    {{ hit.kr_text | safe }} </span>
+              </div>
+            {% endfor %}
+          {% else %}
+            <div class="pill ok" style="display:block;margin:6px 0;" data-ko-key="no_allergy_hit">해당 음식에는 체크하신 알러지를 유발하는 재료가 들어있지 않습니다.</div>
+          {% endif %}
+        </div>
+
+        <h2 style="margin-top:18px" data-ko-key="avoid_foods_list">피하고 싶은 재료</h2>
+        <div id="avoid-list">
+          {% set any_input = false %}
+          {% for f in avoid_foods %}
+            {% if f and f.strip() %}
+              {% set any_input = true %}
+              <span class="pill">{{ f.strip() }}</span>
+            {% endif %}
+          {% endfor %}
+          {% if not any_input %}
+            <div class="small muted" data-ko-key="no_avoid_input"></div>
+          {% endif %}
+        </div>
+
+
+        <h3 style="margin-top:12px" data-ko-key="result_check">결과 :</h3>
+        <div id="avoid-result-list">
+          {# 입력한 재료 포함 여부 안내 문구 #}
+            {% if avoid_hits and avoid_hits|length > 0 %}
+              <div class="small" style="margin-top:8px">
+                <div class="pill warn" style="display:block;margin:6px 0;" data-ko-key="no_allergy_hit">해당 음식에는 입력하신 {{ (avoid_hits | map(attribute='term') | unique | join(', ')) }}(이)가 들어가 있습니다.
+              </div>
+            {% elif any_input %}
+              <div class="small" style="margin-top:8px">
+                <div class="pill ok" style="display:block;margin:6px 0;" data-ko-key="no_allergy_hit">해당 음식에는 피하고 싶은 재료가 들어가 있지 않습니다.
+              </div>
+            {% endif %}
+        </div>
+
+        <div class="row" style="margin-top:16px; justify-content:flex-start">
+          <button class="btn" type="button" id="speakBtn" aria-label="결과를 음성으로 안내" data-ko-key="voice_btn">음성으로 안내</button>
+        </div>
+
+        <div style="margin-top:20px"><a href="/" class="btn" data-ko-key="back_btn"> 처음으로 돌아가기</a></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  const allergyHits = {{ allergy_hits|tojson }};
+  const avoidHits = {{ avoid_hits|tojson }};
+  const selectedAllergens = {{ allergens|tojson }};
+  const foodName = {{ food_name|tojson }};
+  const userEnteredAvoid = {{ (avoid_foods|length > 0)|tojson }};
+  const langBtns = document.querySelectorAll('.lang-btn');
+  let currentLang = localStorage.getItem('appLang') || 'ko'; // localStorage에서 현재 언어 로드
+
+  // 페이지 로드 시, 이미 한국어가 아니면 언어 전환을 즉시 시도
+  document.addEventListener('DOMContentLoaded', () => {
+      // 1. 초기 버튼 활성화
+      langBtns.forEach(btn => btn.classList.remove('active'));
+      const activeBtn = document.getElementById(`lang${currentLang === 'ko' ? 'Ko' : 'En'}`);
+      if (activeBtn) activeBtn.classList.add('active');
+
+      // 2. 현재 언어에 맞게 동적 결과 텍스트를 즉시 교체
+      document.querySelectorAll('[data-kr-text]').forEach(el => {
+          if (currentLang === 'en') {
+              el.innerHTML = el.getAttribute('data-en-text');
+          } else {
+              el.innerHTML = el.getAttribute('data-kr-text');
+          }
+      });
+      
+      // 3. 현재 언어에 맞게 UI와 동적 데이터 교체를 위한 switchLanguage 호출
+      if (currentLang !== 'ko') {
+          switchLanguage(currentLang, false); // false: localStorage 업데이트 방지
+      }
+  });
+
+
+    function buildAnnouncement(lang) {
+      const parts = [];
+      const foodNameText = document.getElementById('food-name-display').textContent;
+    
+      if (lang === 'ko') {
+          parts.push(`예측된 음식은 ${foodNameText}입니다.`);
+      } else {
+          parts.push(`Predicted food is ${foodNameText}.`);
+      }
+    
+      if (selectedAllergens.length > 0) {
+        if (allergyHits.length > 0) {
+          const hits = Array.from(document.querySelectorAll('#allergy-result-list span'))
+            .map(el => el.textContent.trim().replace(/<[^>]*>/g, ''));
+          if (lang === 'ko') {
+              parts.push(`주의. 체크한 알러지와 관련된 재료가 들어가 있습니다. ${hits.join(". 그리고 ")}.`);
+          } else {
+              parts.push(`Warning. Ingredients related to your checked allergens are included. ${hits.join(". And ")}.`);
+          }
+     } else {
+          if (lang === 'ko') {
+              parts.push("체크한 알러지를 유발하는 재료는 발견되지 않았습니다.");
+          } else {
+              parts.push("Ingredients that trigger your checked allergens were not found.");
+          }
+        }
+      }
+    
+      if (userEnteredAvoid) {
+        if (avoidHits.length > 0) {
+          const avoidNames = avoidHits.map(h => h.term).join(", ");
+          if (lang === 'ko') {
+              parts.push(`그리고 해당 음식에는 ${avoidNames}(이)가 들어가 있습니다.`);
+          } else {
+              parts.push(`${avoidNames} you wish to avoid are included.`);
+          }
+        } else {
+          if (lang === 'ko') {
+              parts.push("그리고 해당 음식에는 피하고 싶은 재료가 들어가 있지 않습니다.");
+          } else {
+              parts.push("The ingredients you entered were not included.");
+          }
+        }
+      }
+    
+      return parts.join(" ");
+    }
+
+
+  // [수정] A11Y 텍스트 초기 설정 (현재 언어 기준)
+  const a11yEl = document.getElementById('a11y-announce');
+  const initialMessage = buildAnnouncement(currentLang);
+  if (a11yEl) a11yEl.textContent = initialMessage;
+
+
+  // 포커스 이동으로 스크린리더 진입점 제공
+  const h1 = document.querySelector('.wrap .card h1');
+  if (h1) { h1.setAttribute('tabindex', '-1'); h1.focus({ preventScroll: true }); }
+
+  
+  // [수정] 범용적인 음성 재생 함수로 변경
+  function speakWithVoice(text, lang) {
+    if (!('speechSynthesis' in window)) return false;
+
+    window.speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance(text);
+    
+    const isKo = (l) => (l || '').toLowerCase().startsWith('ko');
+
+    const chooseVoiceAndSpeak = () => {
+      const voices = window.speechSynthesis.getVoices() || [];
+      
+      // 언어 코드 설정 (한국어: ko-KR, 영어: en-US 또는 감지)
+      const targetLangCode = lang === 'ko' ? 'ko-KR' : 'en-US';
+
+      let pick = voices.find(v => (v.lang || '').toLowerCase().startsWith(lang));
+      
+      // 한국어 보이스 우선순위
+      if (lang === 'ko' && !pick) {
+          pick = voices.find(v => isKo(v) && v.name.includes('Yuna')) || voices.find(v => isKo(v));
+      }
+
+      if (pick) {
+        u.voice = pick;
+        u.lang = pick.lang || targetLangCode;
+      } else {
+        u.lang = targetLangCode;
+      }
+
+      // 톤 설정
+      u.pitch  = isKo(u.lang) ? 1.2 : 1.0;
+      u.rate   = 1.0;
+      u.volume = 1.0;
+
+      const resumeInterval = setInterval(() => {
+        window.speechSynthesis.resume();
+      }, 250);
+      u.onend = u.onerror = () => clearInterval(resumeInterval);
+
+      window.speechSynthesis.speak(u);
+    };
+
+    const voicesNow = window.speechSynthesis.getVoices();
+    if (voicesNow && voicesNow.length) chooseVoiceAndSpeak();
+    else window.speechSynthesis.onvoiceschanged = chooseVoiceAndSpeak;
+
+    return true;
+  }
+
+  // 자동 1회 재생 + 실패 시 버튼으로 안내
+  let autoSpoken = false;
+  function tryAutoSpeakOnce() {
+    if (autoSpoken) return;
+    autoSpoken = true;
+    
+    const textToSpeak = buildAnnouncement(currentLang); // 현재 언어로 문구 생성
+    const ok = speakWithVoice(textToSpeak, currentLang); // 해당 언어의 TTS 사용
+
+    setTimeout(() => {
+      if (!window.speechSynthesis.speaking) {
+        const btn = document.getElementById('speakBtn');
+        if (btn) btn.textContent = currentLang === 'ko' ? '음성 켜기 / 다시 듣기' : 'Enable Voice / Replay';
+      }
+    }, 1200);
+  }
+
+  // 약간 지연 후 자동 시도(보이스 로드 대기)
+  window.setTimeout(tryAutoSpeakOnce, 400);
+
+  // 탭 재진입 시(처음 자동재생 실패 대비) 한 번 더 시도
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && !autoSpoken) {
+      tryAutoSpeakOnce();
+    }
+  });
+
+  // 버튼으로 다시 듣기
+  const speakBtn = document.getElementById('speakBtn');
+  if (speakBtn) {
+    speakBtn.addEventListener('click', () => {
+      const textToSpeak = buildAnnouncement(currentLang);
+      speakWithVoice(textToSpeak, currentLang);
+    });
+  }
+  
+  // =================================================================
+  // [수정] 언어 전환 로직 (결과 페이지)
+  function switchLanguage(lang, updateLocalStorage = true) {
+    if (lang === currentLang && updateLocalStorage) return;
+
+    // 1. 버튼 상태 업데이트
+    langBtns.forEach(btn => btn.classList.remove('active'));
+    document.getElementById(`lang${lang === 'ko' ? 'Ko' : 'En'}`).classList.add('active');
+
+    // 2. Local Storage 업데이트
+    if (updateLocalStorage) {
+        localStorage.setItem('appLang', lang);    
+        currentLang = lang; 
+    }
+
+
+    // 3. 서버에서 번역 데이터 요청 (UI 업데이트용)
+    fetch('/translate_text', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ target_lang: lang })
+    })
+    .then(res => res.json())
+    .then(data => {
+        const uiTranslations = data.ui;
+        const dynamicTranslations = data.dynamic;
+        
+        // 4. 정적 UI 텍스트 교체 (data-ko-key 활용)
+        document.querySelectorAll('[data-ko-key]').forEach(el => {
+            const key = el.getAttribute('data-ko-key');
+            if (uiTranslations[key]) {
+                el.innerHTML = uiTranslations[key];
+            }
+        });
+
+        // 5. 동적 결과 문구 교체 (HTML 교체)
+        document.querySelectorAll('[data-kr-text]').forEach(el => {
+            if (lang === 'ko') {
+                el.innerHTML = el.getAttribute('data-kr-text');
+            } else {
+                el.innerHTML = el.getAttribute('data-en-text');
+            }
+        });
+        
+        // 6. 음식 이름 교체
+        const foodNameDisplay = document.getElementById('food-name-display');
+        const koFoodName = foodNameDisplay.textContent; 
+        
+        if (dynamicTranslations.foods && dynamicTranslations.foods[koFoodName]) {
+            foodNameDisplay.textContent = dynamicTranslations.foods[koFoodName];
+        } else {
+            foodNameDisplay.textContent = koFoodName; 
+        }
+        
+        // 7. 알러지 뱃지 텍스트 교체
+        document.querySelectorAll('#checked-allergens .pill').forEach(el => {
+            const koText = el.getAttribute('data-ko-name'); 
+            
+            if (dynamicTranslations.full_allergens && dynamicTranslations.full_allergens[koText]) {
+                el.textContent = dynamicTranslations.full_allergens[koText];
+            } else {
+                 el.textContent = koText; 
+            }
+        });
+
+        // 8. 음성 안내 텍스트 갱신 (스크린리더용)
+        a11yEl.textContent = buildAnnouncement(lang);
+
+        // 9. 음성 안내 버튼 텍스트 갱신
+        const speakBtn = document.getElementById('speakBtn');
+        if (speakBtn) {
+            speakBtn.textContent = lang === 'ko' ? '음성으로 안내' : 'Audio Guide';
+        }
+
+    })
+    .catch(error => {
+        console.error('Translation error:', error);
+        alert('번역 데이터 로드에 실패했습니다.');
+    });
+  }
+
+  langBtns.forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      switchLanguage(e.target.dataset.lang, true);
+    });
+  });
+
+</script>
+"""
+
+
+
+# ===== 후보 선택 페이지 (RESULT_CHOOSE_HTML 정의는 동일) =====
+RESULT_CHOOSE_HTML = BASE_CSS + """
+<div class="wrap">
+  <div class="card">
+    <div class="lang-switch">
+      <button class="lang-btn active" id="langKo" data-lang="ko">한국어</button>
+      <button class="lang-btn" id="langEn" data-lang="en">English</button>
+    </div>
+    <h1 data-ko-key="choose_title"> 음식 후보를 선택해주세요</h1>
+    <p class="muted" data-ko-key="choose_desc">모델 확신도가 낮아 Top-3 후보를 보여드려요. 가장 가까운 음식을 선택하면 결과를 맞춤으로 보여드릴게요.</p>
+
+    <div class="result-grid">
+      <div class="card">{% if img_data_url %}<img src="{{ img_data_url }}" alt="uploaded" style="max-width:100%;border-radius:12px;border:1px solid rgba(0,0,0,.08)">{% endif %}</div>
+      <div class="card">
+        <h2 data-ko-key="candidate_list">후보 목록</h2>
+        <form method="POST" action="/result">
+          <div class="radio-list">
+            {% for cand in top3 %}
+              <label class="choice-card"><input type="radio" name="chosen_food" value="{{ cand.label }}" {% if loop.first %}checked{% endif %}> <b data-ko-name="{{ cand.label }}">{{ cand.label }}</b></label>
+            {% endfor %}
+          </div>
+          <input type="hidden" name="img_token" value="{{ img_token }}">
+          {% for code in allergen_codes %}<input type="hidden" name="allergens" value="{{ code }}">{% endfor %}
+          {% for f in avoid_foods %}<input type="hidden" name="avoid_foods" value="{{ f }}">{% endfor %}
+          <div class="row" style="margin-top:16px; justify-content:flex-end"><button class="btn" type="submit" data-ko-key="select_food_btn">이 음식으로 결과 보기</button></div>
+        </form>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+const langBtns = document.querySelectorAll('.lang-btn');
+let currentLang = localStorage.getItem('appLang') || 'ko';
+
+document.addEventListener('DOMContentLoaded', () => {
+    // 1. 초기 버튼 활성화
+    langBtns.forEach(btn => btn.classList.remove('active'));
+    const activeBtn = document.getElementById(`lang${currentLang === 'ko' ? 'Ko' : 'En'}`);
+    if (activeBtn) activeBtn.classList.add('active');
+
+    // 2. 현재 언어가 'ko'가 아니면 번역 실행
+    if (currentLang !== 'ko') {
+        switchLanguage(currentLang, false); 
+    }
+});
+
+function switchLanguage(lang, updateLocalStorage = true) {
+    if (lang === currentLang && updateLocalStorage) return; 
+
+    // 1. 버튼 상태 업데이트
+    langBtns.forEach(btn => btn.classList.remove('active'));
+    document.getElementById(`lang${lang === 'ko' ? 'Ko' : 'En'}`).classList.add('active');
+
+    // 2. Local Storage 업데이트
+    if (updateLocalStorage) {
+        localStorage.setItem('appLang', lang);
+        currentLang = lang;
+    }
+
+
+    // 3. 서버에서 번역 데이터 요청
+    fetch('/translate_text', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ target_lang: lang })
+    })
+    .then(res => res.json())
+    .then(data => {
+        const uiTranslations = data.ui;
+        const dynamicTranslations = data.dynamic;
+        
+        document.querySelectorAll('[data-ko-key]').forEach(el => {
+            const key = el.getAttribute('data-ko-key');
+            if (uiTranslations[key]) {
+                el.innerHTML = uiTranslations[key];
+            }
+        });
+        
+        document.querySelectorAll('.choice-card b').forEach(el => {
+          const koName = el.textContent;
+          if (dynamicTranslations.foods && dynamicTranslations.foods[koName]) {
+              el.textContent = dynamicTranslations.foods[koName];
+          } else {
+              el.textContent = koName;
+          }
+        });
+    })
+    .catch(error => {
+        console.error('Translation error:', error);
+    });
+}
+
+langBtns.forEach(btn => {
+  btn.addEventListener('click', (e) => {
+    switchLanguage(e.target.dataset.lang, true);
+  });
+});
+</script>
+"""
+
+
+
+@app.route("/", methods=["GET"])
+def index():
+    # 서버는 현재 언어를 'ko'로 가정하고 HTML을 렌더링 (JS가 localStorage를 보고 실제 언어를 결정)
+    return render_template_string(INDEX_HTML, allergens=ALLERGENS, current_lang='ko')
+
+
+@app.route("/result", methods=["POST"])
+def result():
+    # 서버는 현재 언어를 'ko'로 가정하고 HTML을 렌더링
+    current_lang = 'ko' 
+    
+    img = None
+    token = None
+    if "image" in request.files and request.files["image"].filename != "":
+        raw = request.files["image"].read()
+        if not raw: abort(400, "빈 파일입니다.")
+        try:
+            img = Image.open(io.BytesIO(raw)).convert("RGB")  # ← convert 추가
+            token, path = save_temp_image(img)
+        except Exception:
+            abort(400, "이미지 열기 실패")
+        token, path = save_temp_image(img)
+    else:
+        token = request.form.get("img_token", "")
+        img, path = load_temp_image(token)
+
+    buf = io.BytesIO(); img.save(buf, format="JPEG", quality=85)
+    img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+    img_data_url = f"data:image/jpeg;base64,{img_b64}"
+
+    selected_allergen_codes = request.form.getlist("allergens")
+    allergens_kr = [ALLERGEN_MAP.get(code, code) for code in selected_allergen_codes]
+    avoid_foods = [s.strip() for s in request.form.getlist("avoid_foods") if s.strip()]
+
+    with torch.no_grad():
+        x = TFMS(img).unsqueeze(0).to(device)
+        logits = MODEL(x)
+        probs = torch.softmax(logits, dim=1)[0].cpu().tolist()
+    pairs = list(zip(CLASS_NAMES, probs)); pairs.sort(key=lambda t: t[1], reverse=True)
+
+    chosen_food = request.form.get("chosen_food")
+    if chosen_food:
+        food_name = chosen_food
+        prob_lookup = {lbl: p for lbl, p in pairs}; food_prob = float(prob_lookup.get(food_name, 0.0))
+    else:
+        top1_label, top1_prob = pairs[0][0], float(pairs[0][1])
+        if top1_prob < 0.60:
+            top3 = [{"label": lbl, "prob": float(p)} for lbl, p in pairs[:3]]
+            return render_template_string(
+                RESULT_CHOOSE_HTML,
+                top3=top3,
+                img_token=token,
+                img_data_url=img_data_url,
+                allergen_codes=selected_allergen_codes,
+                avoid_foods=avoid_foods,
+                current_lang=current_lang
+            )
+        food_name, food_prob = top1_label, top1_prob
+
+    # ===== XML에서 재료 추출 → 알러지/회피 재료 매칭
+    allergy_hits = []
+    avoid_hits = []
+    texts_to_translate = []
+    
+    try:
+        tree = ET.parse("api_xml_new.xml")
+        root = tree.getroot()
+        data = []
+        for row in root.iter("row"):
+            item = {
+                "레시피번호": (row.findtext("RCP_SEQ") or "").strip(),
+                "레시피명": (row.findtext("RCP_NM") or "").strip(),
+                "재료정보": (row.findtext("RCP_PARTS_DTLS") or "").strip(),
+            }
+            if item["레시피명"] and item["재료정보"]:
+                data.append(item)
+        df = pd.DataFrame(data)
+
+        def fuzzy_search_rapidfuzz(df, query, topn=5):
+            names = df["레시피명"].astype(str).tolist()
+            results = process.extract(query, names, scorer=fuzz.WRatio, limit=topn)
+            out = [{"레시피명": m[0], "점수(0~100)": m[1]} for m in results]
+            return pd.DataFrame(out)
+
+        high_possible_result = fuzzy_search_rapidfuzz(df, food_name, topn=5)
+        if not high_possible_result.empty:
+            recipe_name = high_possible_result.iloc[0]["레시피명"]
+            result_ing = df.loc[df["레시피명"] == recipe_name, "재료정보"]
+            if not result_ing.empty:
+                ingredients = [i.strip() for i in result_ing.iloc[0].split(",") if i.strip()]
+                
+                # 1. 알러지 매칭 및 한국어 문구 생성
+                for code in selected_allergen_codes:
+                    syns = ALLERGEN_ING_SYNONYMS.get(code, [code])
+                    ing_match = None
+                    for ing in ingredients:
+                        if any(s and (s in ing) for s in syns):
+                            ing_match = ing; break
+                    if ing_match:
+                        kr_allergy_name = ALLERGEN_MAP.get(code, code)
+                        kr_text = f"해당 음식에 들어간 <b>{ing_match}</b>(이)가 체크하신 <b>{kr_allergy_name} 알러지</b>를 유발할 수 있습니다."
+                        
+                        texts_to_translate.append(kr_text)
+                        allergy_hits.append({"allergy": kr_allergy_name, "ing": ing_match, "kr_text": kr_text})
+
+                # 2. 회피 재료 매칭 및 한국어 문구 생성
+                for term in avoid_foods:
+                    if any(term and (term in ing) for ing in ingredients):
+                        kr_text = f"해당 음식에는 선택하신 \"<b>{term}</b>\"(이)가 들어있습니다."
+                        
+                        texts_to_translate.append(kr_text)
+                        avoid_hits.append({"term": term, "kr_text": kr_text})
+
+    except Exception as e:
+        print("[WARN] XML 처리 실패:", e)
+
+    # 3. 생성된 모든 한국어 문구를 API로 번역
+    if texts_to_translate:
+        en_translated_texts = translate_text_with_api(texts_to_translate, target_language='en')
+        
+        # 4. 번역 결과를 원래의 리스트에 매핑
+        current_index = 0
+        
+        for hit in allergy_hits:
+            hit['en_text'] = en_translated_texts[current_index]
+            current_index += 1
+            
+        for hit in avoid_hits:
+            hit['en_text'] = en_translated_texts[current_index]
+            current_index += 1
+
+    else:
+        for hit in allergy_hits: hit['en_text'] = hit['kr_text']
+        for hit in avoid_hits: hit['en_text'] = hit['kr_text']
+
+    # [수정] 결과 페이지 렌더링 시에도 current_lang 전달
+    return render_template_string(
+        RESULT_HTML,
+        food_name=food_name,
+        food_prob=food_prob,
+        allergens=allergens_kr,
+        avoid_foods=avoid_foods,
+        img_data_url=img_data_url,
+        allergy_hits=allergy_hits,
+        avoid_hits=avoid_hits,
+        current_lang=current_lang
+    )
+
+@app.errorhandler(RequestEntityTooLarge)
+def handle_file_too_large(e):
+    return ("요청 데이터가 너무 큽니다. 사진 해상도를 낮추거나 다시 시도해주세요.", 413)
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=True, use_reloader=False)
