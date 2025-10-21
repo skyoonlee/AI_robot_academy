@@ -12,7 +12,7 @@ float clip(float value, float min, float max){
 }
 
 int main(void){
-
+ 
     int motor_n;
     double mass, torque, rgr, eta, rad, rrc, sf = 0;
     double tot_t, avail_f, need_f, sin_max, grade, sin_theta, tan_theta, angle;
@@ -48,6 +48,7 @@ int main(void){
 
     if (mass <= 0 || torque <= 0 || motor_n <= 0 || rgr <= 0 || eta <= 0 || eta > 1 || rad <= 0 || rrc < 0 || sf < 1) {
         printf("입력값 범위를 확인하세요.\n");
+        printf("mass >= 0, torque >= 0, motor_n >= 0, rgr >= 0, 0 <= eta< 1, rad >= 0, rrc > 0, sf > 1");
         return 1;
     }
 

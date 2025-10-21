@@ -1,5 +1,7 @@
 {
     "files.associations": {
         "math.h": "c"
-    }
+    },
+    "c-cpp-compile-run.c-linker-flags": "-lm",
+    "c-cpp-compile-run.cpp-linker-flags": "-lm"
 }
