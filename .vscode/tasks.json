@@ -44,6 +44,7 @@
                 "${file}",
                 "-o",
                 "${fileDirname}/${fileBasenameNoExtension}"
+                "-lm"
             ],
             "options": {
                 "cwd": "${fileDirname}"

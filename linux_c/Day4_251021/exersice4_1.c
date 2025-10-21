@@ -1,5 +1,9 @@
-#include<stdio.h>
-#include<math.h>
+#include <stdio.h>
+#include <math.h>
+
+
+extern double sin(double x);
+extern double tan(double x);
 
 float clip(float value, float min, float max){
     if(value < min) return min;
@@ -42,7 +46,10 @@ int main(void){
     printf("안전계수 SF (>=1): ");
     scanf("%lf", &sf);
 
-    if ()
+    if (mass <= 0 || torque <= 0 || motor_n <= 0 || rgr <= 0 || eta <= 0 || eta > 1 || rad <= 0 || rrc < 0 || sf < 1) {
+        printf("입력값 범위를 확인하세요.\n");
+        return 1;
+    }
 
     sin_theta = sin((angle * M_PI) / 180.0);
     tan_theta = tan((angle * M_PI) / 180.0);
