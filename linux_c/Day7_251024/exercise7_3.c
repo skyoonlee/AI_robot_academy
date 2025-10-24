@@ -27,12 +27,16 @@ temp = *pa;
 void line_up(double *maxp, double *midp, double *minp){
 
 
+        if (*maxp < *midp){
+            swap(maxp, midp); 
+        }
+        if (*maxp < *minp){
+            swap(maxp, minp); 
+        }
         if (*midp < *minp){
-            swap(midp, minp); 
+            swap(midp, minp);
         }
 
-
-printf("%lf %lf %lf", *maxp,*midp,*minp);
 }
     
 
