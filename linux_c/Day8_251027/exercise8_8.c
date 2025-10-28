@@ -8,30 +8,26 @@ int main(void){
 
     for (int i=0; i<5; i++){
         sum = 0;
-
+        sum2 = 0;
         for (int j=0; j<6; j++){
 
             sum += arr[i][j];
-            
+        
             if (j == 5){
                 arr[i][j] = sum;
-
             }
-            
-            arr[4][j] += arr[i][j];
 
-        if (i == 4){
-           arr[i][j]= sum2;
-        }
-
-        printf("%d ", arr[i][j]);
-        }
-        printf("\n");
-
-       
+        
+    
+      printf("%5d ", arr[i][j]);
+      
     }
 
+     printf("\n");
 
+
+
+}
 return 0;
 }
 
